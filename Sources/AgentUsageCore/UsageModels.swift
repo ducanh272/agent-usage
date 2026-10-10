@@ -130,3 +130,19 @@ public protocol UsageProvider: Sendable {
     func readQuotaWindows() async throws -> UsageReading<[UsageMetric<QuotaWindow>]>
     func readTokenActivity() async throws -> UsageReading<TokenActivity>
 }
+
+public struct UsageSnapshot: Codable, Equatable, Sendable {
+    public let account: UsageReading<UsageMetric<AccountIdentity>>
+    public let quotaWindows: UsageReading<[UsageMetric<QuotaWindow>]>
+    public let tokenActivity: UsageReading<TokenActivity>
+
+    public init(
+        account: UsageReading<UsageMetric<AccountIdentity>>,
+        quotaWindows: UsageReading<[UsageMetric<QuotaWindow>]>,
+        tokenActivity: UsageReading<TokenActivity>
+    ) {
+        self.account = account
+        self.quotaWindows = quotaWindows
+        self.tokenActivity = tokenActivity
+    }
+}
