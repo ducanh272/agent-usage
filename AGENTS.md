@@ -8,7 +8,9 @@
   CLANG_MODULE_CACHE_PATH=/private/tmp/agent-usage-clang-cache \
   SWIFTPM_MODULECACHE_OVERRIDE=/private/tmp/agent-usage-swift-cache \
   SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
-  swift test --disable-sandbox
+  swift test --disable-sandbox \
+    -Xswiftc -plugin-path \
+    -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing
   ```
 
 - If that SDK path is absent on another Mac, use its installed macOS SDK instead. The selected Swift compiler and SDK must be compatible.
