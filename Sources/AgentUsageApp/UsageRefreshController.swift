@@ -63,6 +63,15 @@ final class UsageRefreshController: ObservableObject {
         await updateSettings(executablePath: settings.codexExecutablePath, homePath: path)
     }
 
+    func setMenuBarDisplayMode(_ mode: MenuBarDisplayMode) async {
+        do {
+            settings = try await store.updateMenuBarDisplayMode(mode)
+            storageError = nil
+        } catch {
+            storageError = "Settings could not be saved."
+        }
+    }
+
     private func updateSettings(executablePath: String, homePath: String) async {
         do {
             settings = try await store.updateSettings(executablePath: executablePath, homePath: homePath)

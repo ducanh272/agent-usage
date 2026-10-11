@@ -5,11 +5,27 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var codexExecutablePath: String
     public var codexHomePath: String
     public var lastAccountID: String?
+    public var menuBarDisplayMode: MenuBarDisplayMode
 
-    public init(codexExecutablePath: String = "", codexHomePath: String = "", lastAccountID: String? = nil) {
+    public init(codexExecutablePath: String = "", codexHomePath: String = "",
+                lastAccountID: String? = nil, menuBarDisplayMode: MenuBarDisplayMode = .iconAndPercentage) {
         self.codexExecutablePath = codexExecutablePath
         self.codexHomePath = codexHomePath
         self.lastAccountID = lastAccountID
+        self.menuBarDisplayMode = menuBarDisplayMode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case codexExecutablePath, codexHomePath, lastAccountID, menuBarDisplayMode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        codexExecutablePath = try values.decodeIfPresent(String.self, forKey: .codexExecutablePath) ?? ""
+        codexHomePath = try values.decodeIfPresent(String.self, forKey: .codexHomePath) ?? ""
+        lastAccountID = try values.decodeIfPresent(String.self, forKey: .lastAccountID)
+        menuBarDisplayMode = try values.decodeIfPresent(MenuBarDisplayMode.self, forKey: .menuBarDisplayMode)
+            ?? .iconAndPercentage
     }
 }
 
@@ -53,6 +69,13 @@ public actor LocalUsageStore {
         var settings = try loadSettings()
         settings.codexExecutablePath = executablePath
         settings.codexHomePath = homePath
+        try write(settings, to: directory.appendingPathComponent("settings.json"))
+        return settings
+    }
+
+    public func updateMenuBarDisplayMode(_ mode: MenuBarDisplayMode) throws -> AppSettings {
+        var settings = try loadSettings()
+        settings.menuBarDisplayMode = mode
         try write(settings, to: directory.appendingPathComponent("settings.json"))
         return settings
     }
