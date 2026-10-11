@@ -44,8 +44,39 @@ struct UsageModelsTests {
     }
 
     private func fixture(_ name: String) throws -> Data {
-        let directory = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        return try Data(contentsOf: directory.appendingPathComponent("docs/fixtures/\(name).json"))
+        TestFixtures.data(name)
+    }
+}
+
+/// Synthetic app-server responses kept in tracked test source for clean CI checkouts.
+enum TestFixtures {
+    static func data(_ name: String) -> Data {
+        let json: String
+        switch name {
+        case "account-read":
+            json = #"""
+                {"account":{"type":"chatgpt","email":"example@example.invalid","planType":"plus"},
+                 "workspaceRouting":{"chatgptAccountId":"account-example"}}
+                """#
+        case "account-rate-limits":
+            json = #"""
+                {"accountId":"account-example",
+                 "rateLimits":{"limitId":"codex",
+                               "primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1893456000},
+                               "secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1893974400}},
+                 "rateLimitsByLimitId":{"codex":{
+                    "limitId":"codex",
+                    "primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1893456000},
+                    "secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1893974400}}}}
+                """#
+        case "account-usage":
+            json = #"""
+                {"summary":{"lifetimeTokens":100000,"peakDailyTokens":5000},
+                 "dailyUsageBuckets":[{"startDate":"2026-01-01","tokens":1000}]}
+                """#
+        default:
+            preconditionFailure("Unknown test fixture: \(name)")
+        }
+        return Data(json.utf8)
     }
 }

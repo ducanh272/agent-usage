@@ -63,9 +63,7 @@ struct CodexUsageProviderTests {
     }
 
     private func fixture(_ name: String) throws -> Data {
-        let directory = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        return try Data(contentsOf: directory.appendingPathComponent("docs/fixtures/\(name).json"))
+        TestFixtures.data(name)
     }
 }
 
