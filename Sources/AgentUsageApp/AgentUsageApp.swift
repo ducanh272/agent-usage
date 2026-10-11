@@ -88,14 +88,18 @@ private struct UsagePanel: View {
                 }
                 .font(.subheadline).lineLimit(1)
             }
-            if disconnected || isStale(state, at: date) || state?.isCached == true {
+            if disconnected || state?.isQuotaStale(at: date) == true || state?.isCached == true {
                 Label(disconnected ? "Saved reading · disconnected" :
-                        isStale(state, at: date) ? "Saved reading · stale" : "Saved reading · awaiting refresh",
+                        state?.isQuotaStale(at: date) == true ? "Saved reading · stale" : "Saved reading · awaiting refresh",
                       systemImage: "clock.arrow.circlepath")
                     .font(.caption).foregroundStyle(.orange)
             } else if (state?.consecutiveFailures ?? 0) > 0 {
                 Label("Refresh failed · showing last reading", systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
+            }
+            if let failure = state?.failure {
+                Text(recoveryMessage(failure)).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             quotaContent(snapshot.quotaWindows, at: date)
             tokenContent(snapshot.tokenActivity)
@@ -105,7 +109,7 @@ private struct UsagePanel: View {
             Text("Connect Codex to view usage. Open Settings to change its location.")
                 .font(.caption).foregroundStyle(.secondary)
         } else if (state?.consecutiveFailures ?? 0) > 0 {
-            Text("Usage could not be loaded. Try Refresh or check sign-in in Settings.")
+            Text(state?.failure.map(recoveryMessage) ?? "Usage could not be loaded. Try Refresh.")
                 .font(.caption).foregroundStyle(.secondary)
         } else {
             Text("Waiting for account usage…").foregroundStyle(.secondary)
@@ -136,7 +140,8 @@ private struct UsagePanel: View {
                                 .accessibilityLabel("\(windowTitle(window)) quota")
                                 .accessibilityValue("\(remaining.formatted(.number.precision(.fractionLength(0)))) percent remaining")
                             if let reset = window.resetsAt {
-                                Text(resetLabel(reset, at: date)).font(.caption2).foregroundStyle(.secondary)
+                                Text(resetLabel(reset, observedAt: metric.observedAt, at: date))
+                                    .font(.caption2).foregroundStyle(.secondary)
                             }
                         }
                     } else {
@@ -211,11 +216,6 @@ private struct UsagePanel: View {
         "\(usage.settingsLoaded)\u{0}\(usage.settings.codexExecutablePath)\u{0}\(usage.settings.codexHomePath)"
     }
 
-    private func isStale(_ state: UsageRefreshState?, at date: Date) -> Bool {
-        guard let refreshed = state?.lastSuccessfulRefresh else { return true }
-        return date < refreshed || date.timeIntervalSince(refreshed) >= 600
-    }
-
     private func windowTitle(_ window: QuotaWindow) -> String {
         let kind = window.kind == .primary ? "Primary" : "Secondary"
         guard let minutes = window.durationMinutes else { return "\(window.limitID) · \(kind)" }
@@ -223,9 +223,10 @@ private struct UsagePanel: View {
         return "\(window.limitID) · \(kind) · \(duration)"
     }
 
-    private func resetLabel(_ reset: Date, at date: Date) -> String {
+    private func resetLabel(_ reset: Date, observedAt: Date, at date: Date) -> String {
         let absolute = reset.formatted(date: .abbreviated, time: .shortened)
         let seconds = reset.timeIntervalSince(date)
+        if observedAt >= reset { return "Reset time passed · latest quota checked after \(absolute)" }
         guard seconds > 0 else { return "Reset time passed · awaiting refresh (\(absolute))" }
         let minutes = Int(ceil(seconds / 60))
         let countdown = minutes < 60 ? "\(minutes)m" : "\(minutes / 60)h \(minutes % 60)m"
@@ -235,8 +236,21 @@ private struct UsagePanel: View {
     private func availabilityMessage(_ status: AvailabilityStatus, metric: String) -> String {
         switch status {
         case .available: return "\(metric) is unavailable."
-        case .unsupported: return "\(metric) is not supported by this Codex version."
+        case .unsupported: return "\(metric) is not supported by this Codex version. Update Codex, then Refresh."
         case .unavailable(let reason): return "\(metric) unavailable: \(reason)"
+        }
+    }
+
+    private func recoveryMessage(_ failure: UsageRefreshFailure) -> String {
+        switch failure {
+        case .cliError:
+            return "Codex could not be reached. Check the executable in Settings, then Recheck sign-in and Refresh."
+        case .signInExpired:
+            return "Codex sign-in expired. Run `codex login` in Terminal, then Recheck sign-in and Refresh."
+        case .incompatibleVersion:
+            return "This Codex version does not support quota reads. Update Codex, then Recheck sign-in and Refresh."
+        case .quotaUnavailable:
+            return "Codex could not return quota data. Check sign-in, then Refresh."
         }
     }
 

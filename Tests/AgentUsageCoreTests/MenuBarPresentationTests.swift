@@ -32,6 +32,14 @@ struct MenuBarPresentationTests {
                                          at: date).text == "0%")
     }
 
+    @Test func resetExpiryMakesCompactLabelUnavailableUntilNewQuota() {
+        let state = state(windows: [80], reset: date.addingTimeInterval(30))
+        #expect(MenuBarPresentation.make(state: state, mode: .iconAndPercentage,
+                                         at: date.addingTimeInterval(29)).text == "20%")
+        #expect(MenuBarPresentation.make(state: state, mode: .iconAndPercentage,
+                                         at: date.addingTimeInterval(30)).text == "—")
+    }
+
     @Test func oldSettingsDecodeAndModePersists() async throws {
         let legacy = Data(#"{"codexExecutablePath":"/codex","codexHomePath":"/home","lastAccountID":"one"}"#.utf8)
         let decoded = try JSONDecoder().decode(AppSettings.self, from: legacy)
@@ -48,13 +56,13 @@ struct MenuBarPresentationTests {
         #expect(restored.codexHomePath == "/home")
     }
 
-    private func state(windows used: [Double], isCached: Bool = false) -> UsageRefreshState {
+    private func state(windows used: [Double], isCached: Bool = false, reset: Date? = nil) -> UsageRefreshState {
         let scope = UsageScope(accountID: "one")
         let availability = SourceAvailability(status: used.isEmpty ? .unsupported : .available,
                                               source: .codexAccountAPI, scope: scope, observedAt: date)
         let windows = used.map {
             UsageMetric(value: QuotaWindow(limitID: "codex", kind: .primary, usedPercent: $0,
-                                           durationMinutes: nil, resetsAt: nil),
+                                           durationMinutes: nil, resetsAt: reset),
                         source: .codexAccountAPI, scope: scope, observedAt: date)
         }
         let snapshot = UsageSnapshot(

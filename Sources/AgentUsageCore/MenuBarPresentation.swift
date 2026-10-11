@@ -17,9 +17,7 @@ public struct MenuBarPresentation: Equatable, Sendable {
     ) -> MenuBarPresentation {
         let remaining: Double?
         if let state,
-           let updated = state.lastSuccessfulRefresh,
-           !state.isCached, !state.isStale,
-           date >= updated, date.timeIntervalSince(updated) < 600,
+           !state.isCached, !state.isQuotaStale(at: date),
            let windows = state.snapshot?.quotaWindows.value {
             remaining = windows.map(\.value.usedPercent)
                 .filter(\.isFinite)

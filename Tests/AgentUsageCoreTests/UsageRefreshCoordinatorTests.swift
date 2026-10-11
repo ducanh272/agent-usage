@@ -15,6 +15,7 @@ struct UsageRefreshCoordinatorTests {
 
         let first = await coordinator.refreshIfStale()
         #expect(first.consecutiveFailures == 1)
+        #expect(first.failure == .cliError)
         #expect(await collector.calls == 1)
         _ = await coordinator.refreshIfStale()
         #expect(await collector.calls == 1)
@@ -91,6 +92,110 @@ struct UsageRefreshCoordinatorTests {
         try await Task.sleep(for: .milliseconds(130))
         await coordinator.stopPolling()
         #expect(await collector.calls >= 2)
+    }
+
+    @Test func pollingRefreshesAtResetBeforeRegularInterval() async throws {
+        let now = Date()
+        let reset = now.addingTimeInterval(0.12)
+        let first = Self.snapshotWithQuota(used: 80, reset: reset, observedAt: now)
+        let second = Self.snapshotWithQuota(used: 20, reset: reset.addingTimeInterval(3600),
+                                            observedAt: reset)
+        let collector = ScriptedCollector(results: [.success(first), .success(second)])
+        let coordinator = UsageRefreshCoordinator(provider: collector, pollInterval: 3600)
+        await coordinator.startPolling()
+        try await Task.sleep(for: .milliseconds(350))
+        await coordinator.stopPolling()
+        #expect(await collector.calls == 2)
+        #expect(await coordinator.currentState().snapshot?.quotaWindows.value?.first?.value.usedPercent == 20)
+    }
+
+    @Test func resetRefreshKeepsOldQuotaStaleUntilConfirmed() async {
+        let clock = TestDateClock()
+        let reset = clock.now().addingTimeInterval(30)
+        let previous = Self.snapshotWithQuota(used: 80, reset: reset, observedAt: clock.now())
+        let missing = Self.snapshotWithQuota(used: nil, reset: nil, observedAt: clock.now())
+        let confirmed = Self.snapshotWithQuota(used: 20, reset: reset.addingTimeInterval(300),
+                                               observedAt: reset)
+        let collector = ScriptedCollector(results: [.success(previous), .success(missing), .success(confirmed)])
+        let coordinator = UsageRefreshCoordinator(provider: collector, now: { clock.now() })
+        _ = await coordinator.refresh()
+        clock.advance(by: 29)
+        _ = await coordinator.refreshIfStale()
+        #expect(await collector.calls == 1)
+
+        clock.advance(by: 1)
+        let beforeRefresh = await coordinator.currentState()
+        #expect(beforeRefresh.isQuotaStale(at: clock.now()))
+        let failed = await coordinator.refreshIfStale()
+        #expect(await collector.calls == 2)
+        #expect(failed.failure == .quotaUnavailable)
+        #expect(failed.isStale)
+        #expect(failed.snapshot?.quotaWindows.value?.first?.value.usedPercent == 80)
+        #expect(failed.lastSuccessfulRefresh == reset.addingTimeInterval(-30))
+
+        let fresh = await coordinator.refresh()
+        #expect(fresh.failure == nil)
+        #expect(!fresh.isQuotaStale(at: clock.now()))
+        #expect(fresh.snapshot?.quotaWindows.value?.first?.value.usedPercent == 20)
+    }
+
+    @Test func unsupportedQuotaAfterRefreshKeepsOldReading() async {
+        let clock = TestDateClock()
+        let previous = Self.snapshotWithQuota(used: 50, reset: nil, observedAt: clock.now())
+        let unsupported = Self.snapshotWithQuota(used: nil, reset: nil, observedAt: clock.now(),
+                                                  quotaStatus: .unsupported)
+        let collector = ScriptedCollector(results: [.success(previous), .success(unsupported)])
+        let coordinator = UsageRefreshCoordinator(provider: collector, now: { clock.now() })
+        _ = await coordinator.refresh()
+        let failed = await coordinator.refresh()
+        #expect(failed.failure == .incompatibleVersion)
+        #expect(failed.snapshot?.quotaWindows.value?.first?.value.usedPercent == 50)
+    }
+
+    @Test func expiredSignInKeepsPriorQuotaStale() async {
+        let clock = TestDateClock()
+        let previous = Self.snapshotWithQuota(used: 65, reset: nil, observedAt: clock.now())
+        let unavailable = Self.snapshotWithQuota(used: nil, reset: nil, observedAt: clock.now())
+        let signOut = UsageSnapshot(
+            account: UsageReading(
+                availability: SourceAvailability(status: .unavailable(reason: "No account is signed in."),
+                                                 source: .codexAccountAPI, scope: UsageScope(accountID: nil),
+                                                 observedAt: clock.now()),
+                value: nil
+            ),
+            quotaWindows: unavailable.quotaWindows,
+            tokenActivity: unavailable.tokenActivity
+        )
+        let collector = ScriptedCollector(results: [.success(previous), .success(signOut)])
+        let coordinator = UsageRefreshCoordinator(provider: collector, now: { clock.now() })
+        _ = await coordinator.refresh()
+        let failed = await coordinator.refresh()
+        #expect(failed.failure == .signInExpired)
+        #expect(failed.isStale)
+        #expect(failed.snapshot?.quotaWindows.value?.first?.value.usedPercent == 65)
+    }
+
+    private static func snapshotWithQuota(
+        used: Double?, reset: Date?, observedAt: Date,
+        quotaStatus: AvailabilityStatus = .unavailable(reason: "Codex account data could not be read.")
+    ) -> UsageSnapshot {
+        let scope = UsageScope(accountID: "account")
+        let accountAvailability = SourceAvailability(status: .available, source: .codexAccountAPI,
+                                                     scope: scope, observedAt: observedAt)
+        let quotaAvailability = SourceAvailability(status: used == nil ? quotaStatus : .available,
+                                                   source: .codexAccountAPI, scope: scope, observedAt: observedAt)
+        let account = UsageMetric(value: AccountIdentity(accountID: "account", email: nil, planType: "plus"),
+                                  source: .codexAccountAPI, scope: scope, observedAt: observedAt)
+        let windows = used.map {
+            [UsageMetric(value: QuotaWindow(limitID: "codex", kind: .primary, usedPercent: $0,
+                                            durationMinutes: 60, resetsAt: reset),
+                         source: .codexAccountAPI, scope: scope, observedAt: observedAt)]
+        }
+        return UsageSnapshot(
+            account: UsageReading(availability: accountAvailability, value: account),
+            quotaWindows: UsageReading(availability: quotaAvailability, value: windows),
+            tokenActivity: UsageReading(availability: quotaAvailability, value: nil)
+        )
     }
 
     private static let snapshot: UsageSnapshot = {
