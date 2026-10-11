@@ -4,18 +4,20 @@ import SwiftUI
 
 @main
 struct AgentUsageApp: App {
+    @StateObject private var usage = UsageRefreshController()
+
     var body: some Scene {
         MenuBarExtra(AppInfo.displayName, systemImage: "chart.bar") {
-            CodexSetupPanel()
+            CodexSetupPanel(usage: usage)
         }
         .menuBarExtraStyle(.window)
     }
 }
 
 private struct CodexSetupPanel: View {
-    @AppStorage("codexExecutablePath") private var executablePath = ""
-    @AppStorage("codexHomePath") private var homePath = ""
+    @ObservedObject var usage: UsageRefreshController
     @State private var result: CodexSetupResult?
+    @State private var showAdvancedSetup = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -24,26 +26,47 @@ private struct CodexSetupPanel: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if let executable = result?.executableURL {
-                LabeledContent("Codex", value: executable.path)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            if result?.status == .ready || usage.state?.isCached == true {
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    Text(usageMessage(at: context.date))
+                        .foregroundStyle(.secondary)
+                }
+                if let snapshot = usage.state?.snapshot {
+                    cachedValues(snapshot)
+                }
+                if result?.status == .ready {
+                    Button("Refresh usage") { Task { await usage.refresh() } }
+                }
             }
-            LabeledContent("Codex home", value: result?.codexHomeURL.path ?? "Checking…")
-                .lineLimit(1)
-                .truncationMode(.middle)
+            if let storageError = usage.storageError {
+                Text(storageError).foregroundStyle(.red)
+            }
 
-            HStack {
-                Button("Choose Codex…", action: chooseExecutable)
-                if !executablePath.isEmpty {
-                    Button("Use Automatic") { executablePath = "" }
+            DisclosureGroup("Advanced setup", isExpanded: $showAdvancedSetup) {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let executable = result?.executableURL {
+                        LabeledContent("Codex", value: executable.path)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    LabeledContent("Codex home", value: result?.codexHomeURL.path ?? "Checking…")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    HStack {
+                        Button("Choose Codex…", action: chooseExecutable)
+                        if !usage.settings.codexExecutablePath.isEmpty {
+                            Button("Use Automatic") { Task { await usage.setExecutablePath("") } }
+                        }
+                    }
+                    HStack {
+                        Button("Choose Home…", action: chooseHome)
+                        if !usage.settings.codexHomePath.isEmpty {
+                            Button("Use Default Home") { Task { await usage.setHomePath("") } }
+                        }
+                    }
                 }
-            }
-            HStack {
-                Button("Choose Home…", action: chooseHome)
-                if !homePath.isEmpty {
-                    Button("Use Default Home") { homePath = "" }
-                }
+                .padding(.top, 6)
             }
             HStack {
                 Button("Recheck") { Task { await checkSetup() } }
@@ -53,13 +76,53 @@ private struct CodexSetupPanel: View {
         }
         .padding()
         .frame(minWidth: 360, alignment: .leading)
-        .task(id: executablePath + "\u{0}" + homePath) { await checkSetup() }
+        .task(id: setupKey) {
+            if usage.settingsLoaded { await checkSetup() }
+        }
+        .onAppear { Task { await usage.panelOpened() } }
+    }
+
+    private var setupKey: String {
+        "\(usage.settingsLoaded)\u{0}\(usage.settings.codexExecutablePath)\u{0}\(usage.settings.codexHomePath)"
+    }
+
+    private func usageMessage(at date: Date) -> String {
+        guard let state = usage.state else { return "Starting usage refresh…" }
+        if let refreshed = state.lastSuccessfulRefresh {
+            let time = refreshed.formatted(date: .abbreviated, time: .shortened)
+            let stale = state.isStale || date < refreshed || date.timeIntervalSince(refreshed) >= 600
+            if state.isCached {
+                return stale ? "Cached from \(time) · stale" : "Cached from \(time) · awaiting refresh"
+            }
+            if state.isRefreshing { return "Refreshing usage · last updated \(time)" }
+            if state.consecutiveFailures > 0 { return "Last updated \(time) · refresh failed; retrying" }
+            return stale ? "Last updated \(time) · stale" : "Usage updated \(time)"
+        }
+        if state.isRefreshing { return "Refreshing usage…" }
+        return state.consecutiveFailures == 0 ? "Waiting for usage data…" : "Usage refresh failed; retrying."
+    }
+
+    @ViewBuilder
+    private func cachedValues(_ snapshot: UsageSnapshot) -> some View {
+        if let email = snapshot.account.value?.value.email {
+            Text(email).font(.caption).foregroundStyle(.secondary)
+        }
+        if let windows = snapshot.quotaWindows.value {
+            ForEach(Array(windows.enumerated()), id: \.offset) { _, metric in
+                let remaining = max(0, 100 - metric.value.usedPercent)
+                Text("\(metric.value.limitID) \(metric.value.kind.rawValue): \(remaining.formatted(.number.precision(.fractionLength(0))))% remaining")
+                    .font(.caption)
+            }
+        }
+        if let tokens = snapshot.tokenActivity.value?.summary?.value.lifetimeTokens {
+            Text("Lifetime tokens: \(tokens.formatted())").font(.caption)
+        }
     }
 
     private var statusMessage: String {
         switch result?.status {
         case .ready:
-            return "Codex is signed in with ChatGPT. Usage data will appear here in a later update."
+            return "Codex is signed in with ChatGPT."
         case .missingInstallation:
             return "Codex CLI was not found. Install it or choose its executable."
         case .invalidExecutableOverride:
@@ -79,12 +142,13 @@ private struct CodexSetupPanel: View {
 
     private func checkSetup() async {
         let configuration = CodexSetupConfiguration(
-            executableOverride: executablePath.isEmpty ? nil : executablePath,
-            homeOverride: homePath.isEmpty ? nil : homePath
+            executableOverride: usage.settings.codexExecutablePath.isEmpty ? nil : usage.settings.codexExecutablePath,
+            homeOverride: usage.settings.codexHomePath.isEmpty ? nil : usage.settings.codexHomePath
         )
         let checked = await CodexSetupChecker().check(configuration: configuration)
         guard !Task.isCancelled else { return }
         result = checked
+        await usage.configure(for: checked)
     }
 
     private func chooseExecutable() {
@@ -93,7 +157,7 @@ private struct CodexSetupPanel: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.showsHiddenFiles = true
-        if panel.runModal() == .OK, let url = panel.url { executablePath = url.path }
+        if panel.runModal() == .OK, let url = panel.url { Task { await usage.setExecutablePath(url.path) } }
     }
 
     private func chooseHome() {
@@ -102,6 +166,6 @@ private struct CodexSetupPanel: View {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.showsHiddenFiles = true
-        if panel.runModal() == .OK, let url = panel.url { homePath = url.path }
+        if panel.runModal() == .OK, let url = panel.url { Task { await usage.setHomePath(url.path) } }
     }
 }
