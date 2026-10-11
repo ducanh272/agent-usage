@@ -1,0 +1,284 @@
+import Foundation
+
+public protocol UsageSnapshotCollecting: Sendable {
+    func collect() async throws -> UsageSnapshot
+}
+
+extension CodexUsageProvider: UsageSnapshotCollecting {}
+
+/// Uses a fresh App Server session for each refresh, so a failed child can be retried.
+public actor CodexSessionCollector: UsageSnapshotCollecting {
+    private let executableURL: URL
+    private let codexHomeURL: URL
+
+    public init(executableURL: URL, codexHomeURL: URL) {
+        self.executableURL = executableURL
+        self.codexHomeURL = codexHomeURL
+    }
+
+    public func collect() async throws -> UsageSnapshot {
+        let transport = CodexAppServerTransport(executableURL: executableURL, codexHomeURL: codexHomeURL)
+        do {
+            try await transport.start()
+            let snapshot = try await CodexUsageProvider(transport: transport).collect()
+            await transport.stop()
+            return snapshot
+        } catch {
+            await transport.stop()
+            throw error
+        }
+    }
+}
+
+public struct UsageRefreshState: Sendable {
+    public let snapshot: UsageSnapshot?
+    public let lastSuccessfulRefresh: Date?
+    public let isRefreshing: Bool
+    public let consecutiveFailures: Int
+    public let isCached: Bool
+    public let isStale: Bool
+    public let failure: UsageRefreshFailure?
+
+    public init(snapshot: UsageSnapshot?, lastSuccessfulRefresh: Date?, isRefreshing: Bool,
+                consecutiveFailures: Int, isCached: Bool = false, isStale: Bool = false,
+                failure: UsageRefreshFailure? = nil) {
+        self.snapshot = snapshot
+        self.lastSuccessfulRefresh = lastSuccessfulRefresh
+        self.isRefreshing = isRefreshing
+        self.consecutiveFailures = consecutiveFailures
+        self.isCached = isCached
+        self.isStale = isStale
+        self.failure = failure
+    }
+
+    public func isQuotaStale(at date: Date) -> Bool {
+        guard let updated = lastSuccessfulRefresh else { return true }
+        if isStale || date < updated || date.timeIntervalSince(updated) >= 600 { return true }
+        return snapshot?.quotaWindows.value?.contains {
+            guard let reset = $0.value.resetsAt else { return false }
+            return reset > updated && reset <= date
+        } ?? false
+    }
+}
+
+public enum UsageRefreshFailure: Equatable, Sendable {
+    case cliError
+    case signInExpired
+    case incompatibleVersion
+    case quotaUnavailable
+}
+
+/// Owns one provider's refresh cadence. All callers share an in-flight collection.
+public actor UsageRefreshCoordinator {
+    private let provider: any UsageSnapshotCollecting
+    private let now: @Sendable () -> Date
+    private var pollInterval: TimeInterval
+    private var snapshot: UsageSnapshot?
+    private var lastSuccessfulRefresh: Date?
+    private var isCached: Bool
+    private var consecutiveFailures = 0
+    private var nextRetryAt: Date?
+    private var failure: UsageRefreshFailure?
+    private var inFlight: Task<UsageSnapshot, Error>?
+    private var inFlightID = 0
+    private var pollingTask: Task<Void, Never>?
+    private let continuation: AsyncStream<UsageRefreshState>.Continuation
+    public nonisolated let updates: AsyncStream<UsageRefreshState>
+
+    public init(
+        provider: any UsageSnapshotCollecting,
+        cachedSnapshot: CachedUsageSnapshot? = nil,
+        pollInterval: TimeInterval = 300,
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
+        self.provider = provider
+        self.pollInterval = pollInterval
+        self.now = now
+        snapshot = cachedSnapshot?.snapshot
+        lastSuccessfulRefresh = cachedSnapshot?.savedAt
+        isCached = cachedSnapshot != nil
+        let stream = AsyncStream.makeStream(of: UsageRefreshState.self, bufferingPolicy: .bufferingNewest(1))
+        updates = stream.stream
+        continuation = stream.continuation
+    }
+
+    public func currentState() -> UsageRefreshState {
+        UsageRefreshState(
+            snapshot: snapshot,
+            lastSuccessfulRefresh: lastSuccessfulRefresh,
+            isRefreshing: inFlight != nil,
+            consecutiveFailures: consecutiveFailures,
+            isCached: isCached,
+            isStale: failure != nil || resetIsDue ||
+                (lastSuccessfulRefresh.map { now().timeIntervalSince($0) >= 600 || now() < $0 } ?? false),
+            failure: failure
+        )
+    }
+
+    /// Polls immediately, then five minutes after a success or after the current failure backoff.
+    public func startPolling() {
+        guard pollingTask == nil else { return }
+        pollingTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                await self.refreshIfDue()
+                let delay = await self.secondsUntilNextPoll()
+                do { try await Task.sleep(for: .seconds(min(delay, 15))) } catch { break }
+            }
+        }
+    }
+
+    public func stopPolling() {
+        pollingTask?.cancel()
+        pollingTask = nil
+    }
+
+    public func setPollInterval(_ interval: TimeInterval) {
+        pollInterval = interval
+        if pollingTask != nil {
+            stopPolling()
+            startPolling()
+        }
+    }
+
+    /// Discards an offline cached reading after the user clears local usage data.
+    public func clearCachedReading() {
+        guard isCached else { return }
+        snapshot = nil
+        lastSuccessfulRefresh = nil
+        isCached = false
+        failure = nil
+        consecutiveFailures = 0
+        nextRetryAt = nil
+        continuation.yield(currentState())
+    }
+
+    /// Used when the panel opens or the Mac wakes. A recent success is kept as-is.
+    @discardableResult
+    public func refreshIfStale(maxAge: TimeInterval = 60) async -> UsageRefreshState {
+        if let inFlight { return await finish(inFlight, id: inFlightID) }
+        if !isCached, !resetIsDue, failure == nil, let lastSuccessfulRefresh,
+           now().timeIntervalSince(lastSuccessfulRefresh) < maxAge {
+            return currentState()
+        }
+        guard retryIsAllowed else { return currentState() }
+        return await refresh()
+    }
+
+    /// Manual refresh bypasses backoff, but joins a collection already in progress.
+    @discardableResult
+    public func refresh() async -> UsageRefreshState {
+        if let inFlight { return await finish(inFlight, id: inFlightID) }
+        inFlightID += 1
+        let id = inFlightID
+        let provider = provider
+        let task = Task { try await provider.collect() }
+        inFlight = task
+        continuation.yield(currentState())
+        return await finish(task, id: id)
+    }
+
+    private func finish(_ task: Task<UsageSnapshot, Error>, id: Int) async -> UsageRefreshState {
+        let result = await task.result
+        guard id == inFlightID, inFlight != nil else { return currentState() }
+        inFlight = nil
+        switch result {
+        case .success(let collected):
+            let issue = Self.issue(in: collected)
+            if collected.quotaWindows.value == nil, snapshot?.quotaWindows.value != nil,
+               Self.sameAccount(snapshot, collected) {
+                // Keep the last confirmed quota when a partial response lacks it.
+                if case .unsupported = collected.quotaWindows.availability.status {
+                    failure = .incompatibleVersion
+                } else {
+                    failure = issue ?? .quotaUnavailable
+                }
+                scheduleRetry()
+            } else if Self.hasAvailableData(collected) {
+                snapshot = collected
+                lastSuccessfulRefresh = now()
+                isCached = false
+                failure = issue
+                if issue == nil {
+                    consecutiveFailures = 0
+                    nextRetryAt = nil
+                } else {
+                    scheduleRetry()
+                }
+            } else {
+                if case .unsupported = collected.quotaWindows.availability.status {
+                    failure = .incompatibleVersion
+                } else {
+                    failure = issue ?? .cliError
+                }
+                scheduleRetry()
+            }
+        case .failure:
+            failure = .cliError
+            scheduleRetry()
+        }
+        let state = currentState()
+        continuation.yield(state)
+        return state
+    }
+
+    private func scheduleRetry() {
+        consecutiveFailures += 1
+        let exponent = min(consecutiveFailures - 1, 4)
+        nextRetryAt = now().addingTimeInterval(min(30 * Double(1 << exponent), pollInterval))
+    }
+
+    private var retryIsAllowed: Bool {
+        guard let nextRetryAt else { return true }
+        return now() >= nextRetryAt
+    }
+
+    private func refreshIfDue() async {
+        guard inFlight == nil, retryIsAllowed else { return }
+        if !isCached, !resetIsDue, nextRetryAt == nil, let lastSuccessfulRefresh,
+           now().timeIntervalSince(lastSuccessfulRefresh) < pollInterval { return }
+        await refresh()
+    }
+
+    private func secondsUntilNextPoll() -> TimeInterval {
+        let target: Date
+        if let nextRetryAt { target = nextRetryAt }
+        else if !isCached, let lastSuccessfulRefresh {
+            target = min(lastSuccessfulRefresh.addingTimeInterval(pollInterval),
+                         nextUnconfirmedReset ?? .distantFuture)
+        }
+        else { target = now().addingTimeInterval(pollInterval) }
+        return max(0.01, target.timeIntervalSince(now()))
+    }
+
+    private static func hasAvailableData(_ snapshot: UsageSnapshot) -> Bool {
+        snapshot.account.value != nil || snapshot.quotaWindows.value != nil || snapshot.tokenActivity.value != nil
+    }
+
+    private var nextUnconfirmedReset: Date? {
+        guard let lastSuccessfulRefresh else { return nil }
+        return snapshot?.quotaWindows.value?
+            .compactMap { $0.value.resetsAt }
+            .filter { $0 > lastSuccessfulRefresh }
+            .min()
+    }
+
+    private var resetIsDue: Bool {
+        nextUnconfirmedReset.map { now() >= $0 } ?? false
+    }
+
+    private static func issue(in snapshot: UsageSnapshot) -> UsageRefreshFailure? {
+        if case .unavailable(reason: "No account is signed in.") = snapshot.account.availability.status {
+            return .signInExpired
+        }
+        return nil
+    }
+
+    private static func sameAccount(_ previous: UsageSnapshot?, _ collected: UsageSnapshot) -> Bool {
+        guard let previousID = previous?.account.value?.value.accountID
+                ?? previous?.quotaWindows.availability.scope.accountID,
+              let newID = collected.account.value?.value.accountID
+                ?? collected.quotaWindows.availability.scope.accountID else { return true }
+        return previousID == newID
+    }
+}
