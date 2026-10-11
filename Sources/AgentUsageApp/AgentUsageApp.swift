@@ -1,72 +1,240 @@
 import AgentUsageCore
 import AppKit
+import Combine
 import SwiftUI
 
+@MainActor
 @main
-struct AgentUsageApp: App {
-    @StateObject private var usage = UsageRefreshController()
+private enum AgentUsageApp {
+    private static let statusBar = StatusBarController()
 
-    var body: some Scene {
-        MenuBarExtra {
-            UsagePanel(usage: usage)
-        } label: {
-            TimelineView(.periodic(from: .now, by: 30)) { context in
-                let presentation = MenuBarPresentation.make(
-                    state: usage.state, mode: usage.settings.menuBarDisplayMode, at: context.date
-                )
-                HStack(spacing: 3) {
-                    Image(systemName: "chart.bar")
-                    if let text = presentation.text { Text(text).monospacedDigit() }
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(presentation.accessibilityLabel)
+    static func main() {
+        let app = NSApplication.shared
+        app.delegate = statusBar
+        app.run()
+    }
+}
+
+@MainActor
+private final class StatusBarController: NSObject, NSApplicationDelegate {
+    private let usage = UsageRefreshController()
+    private let sizing = PopoverSizing()
+    private var statusItem: NSStatusItem?
+    private let popover = NSPopover()
+    private var subscriptions = Set<AnyCancellable>()
+    private var screenObserver: NSObjectProtocol?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.isVisible = true
+        statusItem = item
+        guard let button = item.button else { return }
+        let icon = NSImage(systemSymbolName: "chart.bar", accessibilityDescription: AppInfo.displayName)
+        icon?.isTemplate = true
+        button.image = icon
+        button.imagePosition = .imageLeading
+        button.target = self
+        button.action = #selector(togglePanel)
+
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 380, height: 180)
+        popover.contentViewController = NSHostingController(rootView: UsagePanel(usage: usage, sizing: sizing) { [weak self] height in
+            guard let self, abs(self.popover.contentSize.height - height) >= 1 else { return }
+            self.popover.contentSize = NSSize(width: 380, height: height)
+        })
+
+        usage.$state.combineLatest(usage.$settings)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] state, settings in
+                self?.updateStatus(state: state, mode: settings.menuBarDisplayMode)
             }
+            .store(in: &subscriptions)
+        Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+            .sink { [weak self] date in
+                guard let self else { return }
+                self.updateStatus(state: self.usage.state, mode: self.usage.settings.menuBarDisplayMode, at: date)
+            }
+            .store(in: &subscriptions)
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.updateMaximumHeight() }
         }
-        .menuBarExtraStyle(.window)
+    }
+
+    @objc private func togglePanel() {
+        guard let button = statusItem?.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            updateMaximumHeight()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+
+    private func updateMaximumHeight() {
+        let availableHeight = (statusItem?.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 640
+        sizing.maximumHeight = min(600, max(180, availableHeight - 40))
+    }
+
+    private func updateStatus(state: UsageRefreshState?, mode: MenuBarDisplayMode, at date: Date = .now) {
+        guard let button = statusItem?.button else { return }
+        let presentation = MenuBarPresentation.make(state: state, mode: mode, at: date)
+        button.title = "AU" + (presentation.text.map { " \($0)" } ?? "")
+        button.toolTip = presentation.accessibilityLabel
+        button.setAccessibilityLabel(presentation.accessibilityLabel)
+    }
+}
+
+@MainActor
+private final class PopoverSizing: ObservableObject {
+    @Published var maximumHeight: CGFloat = 600
+}
+
+private enum PanelRegion: Hashable {
+    case header, content, footer
+}
+
+private struct PanelHeightsKey: PreferenceKey {
+    static let defaultValue: [PanelRegion: CGFloat] = [:]
+
+    static func reduce(value: inout [PanelRegion: CGFloat], nextValue: () -> [PanelRegion: CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, next in next })
     }
 }
 
 private struct UsagePanel: View {
     @ObservedObject var usage: UsageRefreshController
+    @ObservedObject var sizing: PopoverSizing
+    let onHeightChange: (CGFloat) -> Void
     @State private var setup: CodexSetupResult?
     @State private var showSettings = false
+    @State private var showClearCacheConfirmation = false
+    @State private var measuredHeights: [PanelRegion: CGFloat] = [:]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            VStack(alignment: .leading, spacing: 12) {
+                measured(header(at: context.date), region: .header)
+                Divider()
+                ScrollView {
+                    measured(middleContent(at: context.date), region: .content)
+                }
+                .frame(height: scrollHeight)
+                Divider()
+                measured(footer(at: context.date), region: .footer)
+            }
+            .padding(16)
+            .frame(width: 380, alignment: .leading)
+            .onPreferenceChange(PanelHeightsKey.self) { measuredHeights = $0 }
+            .onChange(of: desiredHeight) { _, height in onHeightChange(height) }
+            .onAppear { onHeightChange(desiredHeight) }
+        }
+        .task(id: usage.settingsLoaded) { if usage.settingsLoaded { await checkSetup() } }
+        .onAppear {
+            usage.refreshLaunchAtLoginStatus()
+            Task { await usage.panelOpened() }
+        }
+        .confirmationDialog("Clear saved account readings?", isPresented: $showClearCacheConfirmation) {
+            Button("Clear cached usage", role: .destructive) {
+                Task { await usage.clearCachedUsage() }
+            }
+        } message: {
+            Text("Saved quota and token readings will be removed. A connected account can refresh them again.")
+        }
+    }
+
+    private var chromeHeight: CGFloat {
+        32 + 48 + 2 + (measuredHeights[.header] ?? 0) + (measuredHeights[.footer] ?? 0)
+    }
+
+    private var scrollHeight: CGFloat {
+        min(measuredHeights[.content] ?? 1, max(1, sizing.maximumHeight - chromeHeight))
+    }
+
+    private var desiredHeight: CGFloat {
+        min(sizing.maximumHeight, chromeHeight + scrollHeight)
+    }
+
+    private func measured<Content: View>(_ content: Content, region: PanelRegion) -> some View {
+        content.background {
+            GeometryReader { geometry in
+                Color.clear.preference(key: PanelHeightsKey.self, value: [region: geometry.size.height])
+            }
+        }
+    }
+
+    private func header(at date: Date) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(AppInfo.displayName).font(.headline)
+                Text(AppInfo.displayName).font(.headline).accessibilityAddTraits(.isHeader)
                 Spacer()
                 if usage.state?.isRefreshing == true {
                     ProgressView().controlSize(.small).accessibilityLabel("Refreshing usage")
                 }
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    TimelineView(.periodic(from: .now, by: 30)) { context in
-                        content(at: context.date)
-                    }
-                    if let error = usage.storageError {
-                        Text(error).font(.caption).foregroundStyle(.red)
-                    }
-                    if showSettings { settingsContent }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            let fresh = setup?.status == .ready && usage.state?.isCached != true &&
+                usage.state?.isQuotaStale(at: date) == false && usage.state?.failure == nil
+            let plan = UsagePresentation.planLabel(usage.state?.snapshot?.account.value?.value.planType)
+            let icon = setup?.status != .ready ? "exclamationmark.circle" :
+                (fresh ? "checkmark.circle.fill" : "clock.arrow.circlepath")
+            Label {
+                Text(plan).foregroundStyle(.primary)
+            } icon: {
+                Image(systemName: icon)
+                    .foregroundStyle(fresh ? Color.green : Color.secondary)
             }
-            .frame(maxHeight: 600)
-            Divider()
-            HStack {
-                Button("Refresh") { Task { await usage.refresh() } }
-                    .disabled(setup?.status != .ready || usage.state?.isRefreshing == true)
-                Button("Settings") { showSettings.toggle() }
-                    .accessibilityLabel(showSettings ? "Hide settings" : "Show settings")
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-            }
+                .font(.subheadline)
+                .lineLimit(1)
+                .help(plan)
         }
-        .padding(16)
-        .frame(width: 380, alignment: .leading)
-        .task(id: setupKey) { if usage.settingsLoaded { await checkSetup() } }
-        .onAppear { Task { await usage.panelOpened() } }
+    }
+
+    private func middleContent(at date: Date) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            content(at: date)
+            if let error = usage.storageError {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+            if let error = usage.featureError {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+            if let message = usage.cacheMessage {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+            }
+            if showSettings { settingsContent }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func footer(at date: Date) -> some View {
+        HStack(spacing: 10) {
+            if let updated = usage.state?.lastSuccessfulRefresh {
+                let exact = updated.formatted(date: .abbreviated, time: .shortened)
+                Text(UsagePresentation.updatedLabel(updated, now: date))
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .help("Last updated \(exact)")
+                    .accessibilityLabel("Last updated \(exact)")
+            }
+            Spacer(minLength: 4)
+            Button { Task { await usage.refresh() } } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .accessibilityLabel("Refresh")
+            .help("Refresh usage")
+            .disabled(setup?.status != .ready || usage.state?.isRefreshing == true)
+            .keyboardShortcut("r", modifiers: .command)
+            Button { showSettings.toggle() } label: {
+                Image(systemName: "gearshape")
+            }
+            .accessibilityLabel(showSettings ? "Hide settings" : "Show settings")
+            .help(showSettings ? "Hide settings" : "Show settings")
+            .keyboardShortcut(",", modifiers: .command)
+            Button("Quit") { NSApplication.shared.terminate(nil) }
+                .keyboardShortcut("q", modifiers: .command)
+        }
+        .buttonStyle(.borderless)
     }
 
     @ViewBuilder
@@ -79,15 +247,6 @@ private struct UsagePanel: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         if let snapshot = state?.snapshot {
-            if let identity = snapshot.account.value?.value {
-                HStack(spacing: 4) {
-                    Text(identity.email ?? "Codex account").fontWeight(.medium)
-                    if let plan = identity.planType {
-                        Text("· \(plan.capitalized)").foregroundStyle(.secondary)
-                    }
-                }
-                .font(.subheadline).lineLimit(1)
-            }
             if disconnected || state?.isQuotaStale(at: date) == true || state?.isCached == true {
                 Label(disconnected ? "Saved reading · disconnected" :
                         state?.isQuotaStale(at: date) == true ? "Saved reading · stale" : "Saved reading · awaiting refresh",
@@ -102,50 +261,56 @@ private struct UsagePanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             quotaContent(snapshot.quotaWindows, at: date)
+            Divider()
             tokenContent(snapshot.tokenActivity)
         } else if state?.isRefreshing == true {
             Text("Loading account usage…").foregroundStyle(.secondary)
-        } else if disconnected {
-            Text("Connect Codex to view usage. Open Settings to change its location.")
-                .font(.caption).foregroundStyle(.secondary)
-        } else if (state?.consecutiveFailures ?? 0) > 0 {
+        } else if !disconnected, (state?.consecutiveFailures ?? 0) > 0 {
             Text(state?.failure.map(recoveryMessage) ?? "Usage could not be loaded. Try Refresh.")
                 .font(.caption).foregroundStyle(.secondary)
-        } else {
+        } else if !disconnected {
             Text("Waiting for account usage…").foregroundStyle(.secondary)
-        }
-        if let updated = state?.lastSuccessfulRefresh {
-            Text("Last updated \(updated.formatted(date: .abbreviated, time: .shortened))")
-                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 
     private func quotaContent(_ reading: UsageReading<[UsageMetric<QuotaWindow>]>, at date: Date) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Quota").font(.subheadline).fontWeight(.semibold)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Quota").font(.subheadline).fontWeight(.semibold)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                Text("Remaining").font(.caption).foregroundStyle(.secondary)
+            }
             if let windows = reading.value, !windows.isEmpty {
-                ForEach(Array(windows.enumerated()), id: \.offset) { _, metric in
+                let titles = UsagePresentation.quotaTitles(for: windows.map(\.value))
+                ForEach(Array(windows.enumerated()), id: \.offset) { index, metric in
                     let window = metric.value
-                    if window.usedPercent.isFinite {
-                        let remaining = max(0, min(100, 100 - window.usedPercent))
-                        VStack(alignment: .leading, spacing: 4) {
+                    let title = titles[index]
+                    if let remaining = UsagePresentation.remainingPercent(for: window) {
+                        let displayed = Double(Int(remaining.rounded()))
+                        VStack(alignment: .leading, spacing: 5) {
                             HStack {
-                                Text(windowTitle(window))
+                                Text(title).lineLimit(1).help(title)
                                 Spacer()
-                                Text("\(remaining.formatted(.number.precision(.fractionLength(0))))% remaining")
-                                    .fontWeight(.medium)
+                                Text("\(Int(displayed))%")
+                                    .fontWeight(.medium).monospacedDigit()
                             }
-                            .font(.caption)
-                            ProgressView(value: remaining, total: 100)
-                                .accessibilityLabel("\(windowTitle(window)) quota")
-                                .accessibilityValue("\(remaining.formatted(.number.precision(.fractionLength(0)))) percent remaining")
+                            .font(.callout)
+                            ProgressView(value: displayed, total: 100)
+                                .tint(.blue)
+                                .accessibilityLabel("\(title) quota")
+                                .accessibilityValue("\(Int(displayed)) percent remaining")
                             if let reset = window.resetsAt {
-                                Text(resetLabel(reset, observedAt: metric.observedAt, at: date))
+                                let exact = reset.formatted(date: .abbreviated, time: .shortened)
+                                let label = UsagePresentation.resetLabel(reset, observedAt: metric.observedAt, now: date)
+                                Text(label)
                                     .font(.caption2).foregroundStyle(.secondary)
+                                    .help("Reset time: \(exact)")
+                                    .accessibilityLabel("\(label). Reset time: \(exact)")
                             }
                         }
                     } else {
-                        Text("\(windowTitle(window)) quota unavailable")
+                        Text("\(title) quota unavailable")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -157,19 +322,24 @@ private struct UsagePanel: View {
     }
 
     private func tokenContent(_ reading: UsageReading<TokenActivity>) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Account token activity").font(.subheadline).fontWeight(.semibold)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("Token activity").font(.subheadline).fontWeight(.semibold)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                if let lifetime = reading.value?.summary?.value.lifetimeTokens {
+                    Text("Lifetime: \(UsagePresentation.compactTokens(lifetime))")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .help("Lifetime: \(UsagePresentation.fullTokens(lifetime)) tokens")
+                        .accessibilityLabel("Lifetime: \(UsagePresentation.fullTokens(lifetime)) tokens")
+                }
+            }
             if let activity = reading.value {
-                if let summary = activity.summary?.value {
-                    if let lifetime = summary.lifetimeTokens {
-                        LabeledContent("Lifetime", value: lifetime.formatted())
-                    }
-                    if let peak = summary.peakDailyTokens {
-                        LabeledContent("Peak day", value: peak.formatted())
-                    }
+                if let peak = activity.summary?.value.peakDailyTokens {
+                    tokenRow("Peak day", tokens: peak)
                 }
                 ForEach(Array(activity.dailyUsage.sorted { $0.value.date > $1.value.date }.prefix(5)), id: \.value.date) { metric in
-                    LabeledContent(metric.value.date, value: metric.value.tokens.formatted())
+                    tokenRow(UsagePresentation.shortDate(metric.value.date), tokens: metric.value.tokens)
                 }
             } else {
                 Text(availabilityMessage(reading.availability.status, metric: "Token activity"))
@@ -179,10 +349,27 @@ private struct UsagePanel: View {
         .font(.caption)
     }
 
+    private func tokenRow(_ label: String, tokens: Int64) -> some View {
+        let full = UsagePresentation.fullTokens(tokens)
+        return HStack {
+            Text(label)
+            Spacer()
+            Text(UsagePresentation.compactTokens(tokens)).monospacedDigit()
+        }
+        .help("\(label): \(full) tokens")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label): \(full) tokens")
+    }
+
     private var settingsContent: some View {
         VStack(alignment: .leading, spacing: 9) {
             Divider()
             Text("Codex settings").font(.subheadline).fontWeight(.semibold)
+                .accessibilityAddTraits(.isHeader)
+            if let email = usage.state?.snapshot?.account.value?.value.email {
+                LabeledContent("Account", value: email)
+                    .lineLimit(1).truncationMode(.middle).help(email)
+            }
             Picker("Menu bar", selection: Binding(
                 get: { usage.settings.menuBarDisplayMode },
                 set: { mode in Task { await usage.setMenuBarDisplayMode(mode) } }
@@ -190,47 +377,34 @@ private struct UsagePanel: View {
                 Text("Icon and percentage").tag(MenuBarDisplayMode.iconAndPercentage)
                 Text("Icon only").tag(MenuBarDisplayMode.iconOnly)
             }
-            if let executable = setup?.executableURL {
-                LabeledContent("Executable", value: executable.path).lineLimit(1).truncationMode(.middle)
+            Picker("Refresh every", selection: Binding(
+                get: { usage.settings.refreshInterval },
+                set: { interval in Task { await usage.setRefreshInterval(interval) } }
+            )) {
+                Text("1 minute").tag(RefreshInterval.oneMinute)
+                Text("5 minutes").tag(RefreshInterval.fiveMinutes)
+                Text("15 minutes").tag(RefreshInterval.fifteenMinutes)
             }
-            LabeledContent("Home", value: setup?.codexHomeURL.path ?? "Checking…")
-                .lineLimit(1).truncationMode(.middle)
-            HStack {
-                Button("Choose Codex…", action: chooseExecutable)
-                if !usage.settings.codexExecutablePath.isEmpty {
-                    Button("Use Automatic") { Task { await usage.setExecutablePath("") } }
-                }
-            }
-            HStack {
-                Button("Choose Home…", action: chooseHome)
-                if !usage.settings.codexHomePath.isEmpty {
-                    Button("Use Default Home") { Task { await usage.setHomePath("") } }
-                }
-            }
+            .accessibilityHint("Controls how often fresh account usage is requested.")
+            Toggle("Quota alerts at 20% and 5%", isOn: Binding(
+                get: { usage.settings.notificationsEnabled },
+                set: { enabled in Task { await usage.setNotificationsEnabled(enabled) } }
+            ))
+            Toggle("Launch at login", isOn: Binding(
+                get: { usage.launchAtLoginEnabled },
+                set: { usage.setLaunchAtLogin($0) }
+            ))
             Button("Recheck sign-in") { Task { await checkSetup() } }
+            Divider()
+            Text("Data access").font(.subheadline).fontWeight(.semibold)
+                .accessibilityAddTraits(.isHeader)
+            Text("Agent Usage reads account quota and token activity through your signed-in Codex CLI. Saved readings stay on this Mac; credentials and conversation content are not copied.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Clear cached usage") { showClearCacheConfirmation = true }
+                .accessibilityHint("Removes saved account readings from this Mac.")
         }
         .font(.caption)
-    }
-
-    private var setupKey: String {
-        "\(usage.settingsLoaded)\u{0}\(usage.settings.codexExecutablePath)\u{0}\(usage.settings.codexHomePath)"
-    }
-
-    private func windowTitle(_ window: QuotaWindow) -> String {
-        let kind = window.kind == .primary ? "Primary" : "Secondary"
-        guard let minutes = window.durationMinutes else { return "\(window.limitID) · \(kind)" }
-        let duration = minutes < 60 ? "\(minutes)m" : "\(minutes / 60)h \(minutes % 60)m"
-        return "\(window.limitID) · \(kind) · \(duration)"
-    }
-
-    private func resetLabel(_ reset: Date, observedAt: Date, at date: Date) -> String {
-        let absolute = reset.formatted(date: .abbreviated, time: .shortened)
-        let seconds = reset.timeIntervalSince(date)
-        if observedAt >= reset { return "Reset time passed · latest quota checked after \(absolute)" }
-        guard seconds > 0 else { return "Reset time passed · awaiting refresh (\(absolute))" }
-        let minutes = Int(ceil(seconds / 60))
-        let countdown = minutes < 60 ? "\(minutes)m" : "\(minutes / 60)h \(minutes % 60)m"
-        return "Resets in \(countdown) · \(absolute)"
     }
 
     private func availabilityMessage(_ status: AvailabilityStatus, metric: String) -> String {
@@ -244,7 +418,7 @@ private struct UsagePanel: View {
     private func recoveryMessage(_ failure: UsageRefreshFailure) -> String {
         switch failure {
         case .cliError:
-            return "Codex could not be reached. Check the executable in Settings, then Recheck sign-in and Refresh."
+            return "Codex could not be reached. Check the CLI installation, then Recheck sign-in and Refresh."
         case .signInExpired:
             return "Codex sign-in expired. Run `codex login` in Terminal, then Recheck sign-in and Refresh."
         case .incompatibleVersion:
@@ -257,42 +431,20 @@ private struct UsagePanel: View {
     private var statusMessage: String {
         switch setup?.status {
         case .ready: return "Codex is signed in with ChatGPT."
-        case .missingInstallation: return "Codex CLI was not found. Install it or choose its executable in Settings."
-        case .invalidExecutableOverride: return "The selected Codex path is not executable. Choose another file in Settings."
-        case .invalidHomeDirectory: return "The Codex home directory does not exist. Choose another directory in Settings."
+        case .missingInstallation: return "Codex CLI was not found. Install it, then Recheck sign-in."
+        case .invalidExecutableOverride: return "The Codex executable is invalid. Reinstall Codex, then Recheck sign-in."
+        case .invalidHomeDirectory: return "The Codex home directory does not exist. Check CODEX_HOME, then Recheck sign-in."
         case .missingSignIn: return "Codex is not signed in. Run `codex login` in Terminal, then recheck."
         case .unsupportedAuthentication: return "Sign in with ChatGPT using `codex login`, then recheck."
-        case .unableToCheckLogin: return "Could not check sign-in. Run `codex login status` in Terminal and verify Settings."
+        case .unableToCheckLogin: return "Could not check sign-in. Run `codex login status` in Terminal, then Recheck sign-in."
         case nil: return "Checking Codex setup…"
         }
     }
 
     private func checkSetup() async {
-        let configuration = CodexSetupConfiguration(
-            executableOverride: usage.settings.codexExecutablePath.isEmpty ? nil : usage.settings.codexExecutablePath,
-            homeOverride: usage.settings.codexHomePath.isEmpty ? nil : usage.settings.codexHomePath
-        )
-        let checked = await CodexSetupChecker().check(configuration: configuration)
+        let checked = await CodexSetupChecker().check()
         guard !Task.isCancelled else { return }
         setup = checked
         await usage.configure(for: checked)
-    }
-
-    private func chooseExecutable() {
-        let panel = NSOpenPanel()
-        panel.message = "Choose the Codex executable"
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.showsHiddenFiles = true
-        if panel.runModal() == .OK, let url = panel.url { Task { await usage.setExecutablePath(url.path) } }
-    }
-
-    private func chooseHome() {
-        let panel = NSOpenPanel()
-        panel.message = "Choose the Codex home directory"
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.showsHiddenFiles = true
-        if panel.runModal() == .OK, let url = panel.url { Task { await usage.setHomePath(url.path) } }
     }
 }

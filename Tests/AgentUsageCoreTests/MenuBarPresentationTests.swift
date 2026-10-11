@@ -44,16 +44,17 @@ struct MenuBarPresentationTests {
         let legacy = Data(#"{"codexExecutablePath":"/codex","codexHomePath":"/home","lastAccountID":"one"}"#.utf8)
         let decoded = try JSONDecoder().decode(AppSettings.self, from: legacy)
         #expect(decoded.menuBarDisplayMode == .iconAndPercentage)
+        #expect(decoded.lastAccountID == "one")
+        let rewritten = String(decoding: try JSONEncoder().encode(decoded), as: UTF8.self)
+        #expect(!rewritten.contains("codexExecutablePath"))
+        #expect(!rewritten.contains("codexHomePath"))
 
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = LocalUsageStore(directory: directory)
-        _ = try await store.updateSettings(executablePath: "/codex", homePath: "/home")
         _ = try await store.updateMenuBarDisplayMode(.iconOnly)
         let restored = try await store.loadSettings()
         #expect(restored.menuBarDisplayMode == .iconOnly)
-        #expect(restored.codexExecutablePath == "/codex")
-        #expect(restored.codexHomePath == "/home")
     }
 
     private func state(windows used: [Double], isCached: Bool = false, reset: Date? = nil) -> UsageRefreshState {

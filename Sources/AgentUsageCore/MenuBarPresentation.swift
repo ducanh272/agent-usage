@@ -19,9 +19,7 @@ public struct MenuBarPresentation: Equatable, Sendable {
         if let state,
            !state.isCached, !state.isQuotaStale(at: date),
            let windows = state.snapshot?.quotaWindows.value {
-            remaining = windows.map(\.value.usedPercent)
-                .filter(\.isFinite)
-                .map { max(0, min(100, 100 - $0)) }
+            remaining = windows.compactMap { UsagePresentation.remainingPercent(for: $0.value) }
                 .min()
         } else {
             remaining = nil

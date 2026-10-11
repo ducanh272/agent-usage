@@ -109,6 +109,32 @@ struct UsageRefreshCoordinatorTests {
         #expect(await coordinator.currentState().snapshot?.quotaWindows.value?.first?.value.usedPercent == 20)
     }
 
+    @Test func changingIntervalReschedulesPolling() async throws {
+        let collector = ScriptedCollector(results: Array(repeating: .success(Self.snapshot), count: 10))
+        let coordinator = UsageRefreshCoordinator(provider: collector, pollInterval: 3600)
+        await coordinator.startPolling()
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(await collector.calls == 1)
+        await coordinator.setPollInterval(0.04)
+        try await Task.sleep(for: .milliseconds(130))
+        await coordinator.stopPolling()
+        #expect(await collector.calls >= 2)
+    }
+
+    @Test func clearingOfflineReadingRemovesItFromState() async {
+        let clock = TestDateClock()
+        let cached = CachedUsageSnapshot(accountID: "account", snapshot: Self.snapshot, savedAt: clock.now())
+        let coordinator = UsageRefreshCoordinator(
+            provider: ScriptedCollector(results: []), cachedSnapshot: cached, now: { clock.now() }
+        )
+        #expect(await coordinator.currentState().snapshot != nil)
+        await coordinator.clearCachedReading()
+        let cleared = await coordinator.currentState()
+        #expect(cleared.snapshot == nil)
+        #expect(cleared.lastSuccessfulRefresh == nil)
+        #expect(!cleared.isCached)
+    }
+
     @Test func resetRefreshKeepsOldQuotaStaleUntilConfirmed() async {
         let clock = TestDateClock()
         let reset = clock.now().addingTimeInterval(30)

@@ -2,30 +2,31 @@ import CryptoKit
 import Foundation
 
 public struct AppSettings: Codable, Equatable, Sendable {
-    public var codexExecutablePath: String
-    public var codexHomePath: String
     public var lastAccountID: String?
     public var menuBarDisplayMode: MenuBarDisplayMode
+    public var notificationsEnabled: Bool
+    public var refreshInterval: RefreshInterval
 
-    public init(codexExecutablePath: String = "", codexHomePath: String = "",
-                lastAccountID: String? = nil, menuBarDisplayMode: MenuBarDisplayMode = .iconAndPercentage) {
-        self.codexExecutablePath = codexExecutablePath
-        self.codexHomePath = codexHomePath
+    public init(lastAccountID: String? = nil, menuBarDisplayMode: MenuBarDisplayMode = .iconAndPercentage,
+                notificationsEnabled: Bool = false, refreshInterval: RefreshInterval = .fiveMinutes) {
         self.lastAccountID = lastAccountID
         self.menuBarDisplayMode = menuBarDisplayMode
+        self.notificationsEnabled = notificationsEnabled
+        self.refreshInterval = refreshInterval
     }
 
     private enum CodingKeys: String, CodingKey {
-        case codexExecutablePath, codexHomePath, lastAccountID, menuBarDisplayMode
+        case lastAccountID, menuBarDisplayMode, notificationsEnabled, refreshInterval
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        codexExecutablePath = try values.decodeIfPresent(String.self, forKey: .codexExecutablePath) ?? ""
-        codexHomePath = try values.decodeIfPresent(String.self, forKey: .codexHomePath) ?? ""
-        lastAccountID = try values.decodeIfPresent(String.self, forKey: .lastAccountID)
-        menuBarDisplayMode = try values.decodeIfPresent(MenuBarDisplayMode.self, forKey: .menuBarDisplayMode)
+        lastAccountID = try? values.decode(String.self, forKey: .lastAccountID)
+        menuBarDisplayMode = (try? values.decode(MenuBarDisplayMode.self, forKey: .menuBarDisplayMode))
             ?? .iconAndPercentage
+        notificationsEnabled = (try? values.decode(Bool.self, forKey: .notificationsEnabled)) ?? false
+        refreshInterval = (try? values.decode(RefreshInterval.self, forKey: .refreshInterval))
+            ?? .fiveMinutes
     }
 }
 
@@ -62,14 +63,12 @@ public actor LocalUsageStore {
     public func loadSettings() throws -> AppSettings {
         let url = directory.appendingPathComponent("settings.json")
         guard fileManager.fileExists(atPath: url.path) else { return AppSettings() }
-        return try decoder.decode(AppSettings.self, from: Data(contentsOf: url))
-    }
-
-    public func updateSettings(executablePath: String, homePath: String) throws -> AppSettings {
-        var settings = try loadSettings()
-        settings.codexExecutablePath = executablePath
-        settings.codexHomePath = homePath
-        try write(settings, to: directory.appendingPathComponent("settings.json"))
+        let data = try Data(contentsOf: url)
+        let settings = try decoder.decode(AppSettings.self, from: data)
+        if let fields = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+           fields["codexExecutablePath"] != nil || fields["codexHomePath"] != nil {
+            try write(settings, to: url)
+        }
         return settings
     }
 
@@ -78,6 +77,43 @@ public actor LocalUsageStore {
         settings.menuBarDisplayMode = mode
         try write(settings, to: directory.appendingPathComponent("settings.json"))
         return settings
+    }
+
+    public func updateNotificationsEnabled(_ enabled: Bool) throws -> AppSettings {
+        var settings = try loadSettings()
+        settings.notificationsEnabled = enabled
+        try write(settings, to: directory.appendingPathComponent("settings.json"))
+        return settings
+    }
+
+    public func updateRefreshInterval(_ interval: RefreshInterval) throws -> AppSettings {
+        var settings = try loadSettings()
+        settings.refreshInterval = interval
+        try write(settings, to: directory.appendingPathComponent("settings.json"))
+        return settings
+    }
+
+    /// Removes only saved account readings. Preferences and alert history stay intact.
+    public func clearCachedUsage() throws -> AppSettings {
+        let accounts = directory.appendingPathComponent("accounts", isDirectory: true)
+        if fileManager.fileExists(atPath: accounts.path) {
+            try fileManager.removeItem(at: accounts)
+        }
+        var settings = try loadSettings()
+        settings.lastAccountID = nil
+        try write(settings, to: directory.appendingPathComponent("settings.json"))
+        return settings
+    }
+
+    /// Persists deduplication before callers submit notifications to the system.
+    public func alertsToSend(for state: UsageRefreshState, at date: Date = Date()) throws -> [QuotaAlert] {
+        let url = directory.appendingPathComponent("sent-alerts.json")
+        var ledger = fileManager.fileExists(atPath: url.path)
+            ? try decoder.decode(QuotaAlertLedger.self, from: Data(contentsOf: url))
+            : QuotaAlertLedger()
+        let alerts = ledger.newAlerts(for: state, at: date)
+        if !alerts.isEmpty { try write(ledger, to: url) }
+        return alerts
     }
 
     /// Anonymous readings are not cached because they cannot be safely assigned to an account.

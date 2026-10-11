@@ -2,6 +2,18 @@ import AgentUsageCore
 import AppKit
 import Combine
 import Foundation
+import ServiceManagement
+import UserNotifications
+
+private final class UsageNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+}
 
 @MainActor
 final class UsageRefreshController: ObservableObject {
@@ -9,6 +21,9 @@ final class UsageRefreshController: ObservableObject {
     @Published private(set) var settings = AppSettings()
     @Published private(set) var settingsLoaded = false
     @Published private(set) var storageError: String?
+    @Published private(set) var featureError: String?
+    @Published private(set) var cacheMessage: String?
+    @Published private(set) var launchAtLoginEnabled = false
 
     private let store = LocalUsageStore()
     private var cachedSnapshot: CachedUsageSnapshot?
@@ -18,8 +33,11 @@ final class UsageRefreshController: ObservableObject {
     private var configurationID = 0
     private var lastPersistedRefresh: Date?
     private var wakeObserver: NSObjectProtocol?
+    private let notificationDelegate = UsageNotificationDelegate()
 
     init() {
+        UNUserNotificationCenter.current().delegate = notificationDelegate
+        launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -31,36 +49,16 @@ final class UsageRefreshController: ObservableObject {
     private func loadAndStart() async {
         do {
             settings = try await store.loadSettings()
-            let legacyExecutable = UserDefaults.standard.string(forKey: "codexExecutablePath") ?? ""
-            let legacyHome = UserDefaults.standard.string(forKey: "codexHomePath") ?? ""
-            if settings.codexExecutablePath.isEmpty, settings.codexHomePath.isEmpty,
-               !legacyExecutable.isEmpty || !legacyHome.isEmpty {
-                settings = try await store.updateSettings(executablePath: legacyExecutable, homePath: legacyHome)
-                UserDefaults.standard.removeObject(forKey: "codexExecutablePath")
-                UserDefaults.standard.removeObject(forKey: "codexHomePath")
-            }
+            UserDefaults.standard.removeObject(forKey: "codexExecutablePath")
+            UserDefaults.standard.removeObject(forKey: "codexHomePath")
             cachedSnapshot = try await store.loadLatestSnapshot()
             if let cachedSnapshot { state = cachedState(cachedSnapshot) }
         } catch {
             storageError = "Saved usage data could not be loaded."
         }
         settingsLoaded = true
-        let executable = settings.codexExecutablePath
-        let home = settings.codexHomePath
-        let setup = await CodexSetupChecker().check(configuration: CodexSetupConfiguration(
-            executableOverride: executable.isEmpty ? nil : executable,
-            homeOverride: home.isEmpty ? nil : home
-        ))
-        guard executable == settings.codexExecutablePath, home == settings.codexHomePath else { return }
+        let setup = await CodexSetupChecker().check()
         await configure(for: setup)
-    }
-
-    func setExecutablePath(_ path: String) async {
-        await updateSettings(executablePath: path, homePath: settings.codexHomePath)
-    }
-
-    func setHomePath(_ path: String) async {
-        await updateSettings(executablePath: settings.codexExecutablePath, homePath: path)
     }
 
     func setMenuBarDisplayMode(_ mode: MenuBarDisplayMode) async {
@@ -72,12 +70,76 @@ final class UsageRefreshController: ObservableObject {
         }
     }
 
-    private func updateSettings(executablePath: String, homePath: String) async {
+    func setNotificationsEnabled(_ enabled: Bool) async {
+        if enabled {
+            do {
+                let allowed = try await UNUserNotificationCenter.current()
+                    .requestAuthorization(options: [.alert, .sound])
+                guard allowed else {
+                    featureError = "Allow Agent Usage notifications in System Settings, then try again."
+                    return
+                }
+            } catch {
+                featureError = "Notification permission could not be requested."
+                return
+            }
+        }
         do {
-            settings = try await store.updateSettings(executablePath: executablePath, homePath: homePath)
+            settings = try await store.updateNotificationsEnabled(enabled)
+            featureError = nil
+        } catch {
+            storageError = "Settings could not be saved."
+        }
+    }
+
+    func setRefreshInterval(_ interval: RefreshInterval) async {
+        do {
+            settings = try await store.updateRefreshInterval(interval)
+            await coordinator?.setPollInterval(interval.seconds)
             storageError = nil
         } catch {
             storageError = "Settings could not be saved."
+        }
+    }
+
+    func clearCachedUsage() async {
+        do {
+            let wasCached = state?.isCached == true
+            settings = try await store.clearCachedUsage()
+            cachedSnapshot = nil
+            lastPersistedRefresh = nil
+            if wasCached {
+                if let coordinator {
+                    await coordinator.clearCachedReading()
+                    state = await coordinator.currentState()
+                    await refresh()
+                } else {
+                    state = nil
+                }
+            }
+            cacheMessage = "Saved account readings cleared."
+            storageError = nil
+        } catch {
+            storageError = "Saved account readings could not be cleared."
+        }
+    }
+
+    func refreshLaunchAtLoginStatus() {
+        launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            refreshLaunchAtLoginStatus()
+            featureError = nil
+        } catch {
+            refreshLaunchAtLoginStatus()
+            featureError = "Launch at login could not be changed. Open the packaged app from Applications and try again."
         }
     }
 
@@ -110,7 +172,10 @@ final class UsageRefreshController: ObservableObject {
         guard id == configurationID else { return }
 
         let collector = CodexSessionCollector(executableURL: executable, codexHomeURL: home)
-        let next = UsageRefreshCoordinator(provider: collector, cachedSnapshot: cachedSnapshot)
+        let next = UsageRefreshCoordinator(
+            provider: collector, cachedSnapshot: cachedSnapshot,
+            pollInterval: settings.refreshInterval.seconds
+        )
         coordinator = next
         configuredPaths = (executable, home)
         state = await next.currentState()
@@ -134,6 +199,33 @@ final class UsageRefreshController: ObservableObject {
             storageError = nil
         } catch {
             storageError = "Usage data could not be saved."
+        }
+        if settings.notificationsEnabled {
+            await sendAlerts(for: update)
+        }
+    }
+
+    private func sendAlerts(for state: UsageRefreshState) async {
+        let center = UNUserNotificationCenter.current()
+        let authorization = await center.notificationSettings().authorizationStatus
+        guard authorization == .authorized || authorization == .provisional else {
+            featureError = "Notifications are off in System Settings."
+            return
+        }
+        do {
+            let alerts = try await store.alertsToSend(for: state)
+            for alert in alerts {
+                let content = UNMutableNotificationContent()
+                content.title = "Codex quota low"
+                content.body = "\(alert.limitID) \(alert.kind.rawValue): \(alert.remainingPercent)% remaining"
+                content.sound = .default
+                try await center.add(UNNotificationRequest(
+                    identifier: alert.identifier, content: content, trigger: nil
+                ))
+            }
+            if !alerts.isEmpty { featureError = nil }
+        } catch {
+            featureError = "Quota alerts could not be saved or delivered."
         }
     }
 

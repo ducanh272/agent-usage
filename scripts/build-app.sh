@@ -13,5 +13,8 @@ mkdir -p "$app_dir/Contents/MacOS"
 cp "$project_dir/Resources/Info.plist" "$app_dir/Contents/Info.plist"
 cp "$(swift build --disable-sandbox -debug-info-format none -c release --show-bin-path)/AgentUsageApp" "$app_dir/Contents/MacOS/AgentUsageApp"
 chmod 755 "$app_dir/Contents/MacOS/AgentUsageApp"
+# Copying the SwiftPM binary into a bundle invalidates its embedded signature.
+# Sign the finished bundle so macOS can launch it.
+codesign --force --sign - "$app_dir"
 
 printf '%s\n' "$app_dir"

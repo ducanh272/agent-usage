@@ -10,8 +10,7 @@ struct LocalUsageStoreTests {
         let firstDate = Date(timeIntervalSince1970: 1_900_000_000)
         let secondDate = firstDate.addingTimeInterval(60)
 
-        let settings = try await store.updateSettings(executablePath: "/custom/codex", homePath: "/custom/home")
-        #expect(settings.codexExecutablePath == "/custom/codex")
+        _ = try await store.updateRefreshInterval(.fifteenMinutes)
         _ = try await store.save(snapshot(for: "account-one"), at: firstDate)
         _ = try await store.save(snapshot(for: "account-two"), at: secondDate)
 
@@ -24,10 +23,8 @@ struct LocalUsageStoreTests {
         #expect(latest == second)
 
         let restored = try await store.loadSettings()
-        #expect(restored.codexExecutablePath == "/custom/codex")
-        #expect(restored.codexHomePath == "/custom/home")
+        #expect(restored.refreshInterval == .fifteenMinutes)
         #expect(restored.lastAccountID == "account-two")
-        _ = try await store.updateSettings(executablePath: "", homePath: "")
         #expect(try await store.loadLatestSnapshot()?.accountID == "account-two")
 
         let files = try FileManager.default.contentsOfDirectory(
@@ -72,6 +69,62 @@ struct LocalUsageStoreTests {
         #expect(!cached.isStale(at: date.addingTimeInterval(599)))
         #expect(cached.isStale(at: date.addingTimeInterval(600)))
         #expect(cached.isStale(at: date.addingTimeInterval(-1)))
+    }
+
+    @Test func refreshIntervalDefaultsAndPersists() async throws {
+        let legacy = Data(#"{"codexExecutablePath":"/codex","codexHomePath":""}"#.utf8)
+        #expect(try JSONDecoder().decode(AppSettings.self, from: legacy).refreshInterval == .fiveMinutes)
+        let unknown = Data(#"{"refreshInterval":99,"menuBarDisplayMode":"future"}"#.utf8)
+        let recovered = try JSONDecoder().decode(AppSettings.self, from: unknown)
+        #expect(recovered.refreshInterval == .fiveMinutes)
+        #expect(recovered.menuBarDisplayMode == .iconAndPercentage)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = LocalUsageStore(directory: directory)
+        _ = try await store.updateRefreshInterval(.oneMinute)
+        #expect(try await store.loadSettings().refreshInterval == .oneMinute)
+        _ = try await store.updateMenuBarDisplayMode(.iconOnly)
+        #expect(try await store.loadSettings().refreshInterval == .oneMinute)
+        _ = try await store.updateRefreshInterval(.fifteenMinutes)
+        #expect(try await store.loadSettings().refreshInterval.seconds == 900)
+    }
+
+    @Test func oldPathSettingsAreRemovedOnLoad() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("settings.json")
+        try Data(#"{"codexExecutablePath":"/old/codex","codexHomePath":"/old/home","lastAccountID":"one","refreshInterval":15}"#.utf8)
+            .write(to: url)
+        let store = LocalUsageStore(directory: directory)
+        let settings = try await store.loadSettings()
+        #expect(settings.lastAccountID == "one")
+        #expect(settings.refreshInterval == .fifteenMinutes)
+        let rewritten = try String(contentsOf: url, encoding: .utf8)
+        #expect(!rewritten.contains("codexExecutablePath"))
+        #expect(!rewritten.contains("codexHomePath"))
+    }
+
+    @Test func clearingUsageKeepsPreferencesAndAlertHistory() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = LocalUsageStore(directory: directory)
+        _ = try await store.updateMenuBarDisplayMode(.iconOnly)
+        _ = try await store.updateRefreshInterval(.fifteenMinutes)
+        _ = try await store.updateNotificationsEnabled(true)
+        _ = try await store.save(snapshot(for: "one"))
+        _ = try await store.save(snapshot(for: "two"))
+        let history = directory.appendingPathComponent("sent-alerts.json")
+        try Data(#"{"sentIdentifiers":[]}"#.utf8).write(to: history)
+
+        let cleared = try await store.clearCachedUsage()
+        #expect(cleared.lastAccountID == nil)
+        #expect(cleared.menuBarDisplayMode == .iconOnly)
+        #expect(cleared.refreshInterval == .fifteenMinutes)
+        #expect(cleared.notificationsEnabled)
+        #expect(try await store.loadLatestSnapshot() == nil)
+        #expect(try await store.loadSnapshot(for: "one") == nil)
+        #expect(FileManager.default.fileExists(atPath: history.path))
     }
 
     private func snapshot(for accountID: String?) -> UsageSnapshot {

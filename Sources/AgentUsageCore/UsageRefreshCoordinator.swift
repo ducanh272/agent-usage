@@ -72,7 +72,7 @@ public enum UsageRefreshFailure: Equatable, Sendable {
 public actor UsageRefreshCoordinator {
     private let provider: any UsageSnapshotCollecting
     private let now: @Sendable () -> Date
-    private let pollInterval: TimeInterval
+    private var pollInterval: TimeInterval
     private var snapshot: UsageSnapshot?
     private var lastSuccessfulRefresh: Date?
     private var isCached: Bool
@@ -131,6 +131,26 @@ public actor UsageRefreshCoordinator {
     public func stopPolling() {
         pollingTask?.cancel()
         pollingTask = nil
+    }
+
+    public func setPollInterval(_ interval: TimeInterval) {
+        pollInterval = interval
+        if pollingTask != nil {
+            stopPolling()
+            startPolling()
+        }
+    }
+
+    /// Discards an offline cached reading after the user clears local usage data.
+    public func clearCachedReading() {
+        guard isCached else { return }
+        snapshot = nil
+        lastSuccessfulRefresh = nil
+        isCached = false
+        failure = nil
+        consecutiveFailures = 0
+        nextRetryAt = nil
+        continuation.yield(currentState())
     }
 
     /// Used when the panel opens or the Mac wakes. A recent success is kept as-is.
