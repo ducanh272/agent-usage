@@ -1,3 +1,24 @@
+# Build products and release packages
 .build/
 .swiftpm/
+dist/
+
+# Local macOS and editor state
 .DS_Store
+.vscode/
+.idea/
+xcuserdata/
+*.xcuserstate
+
+# Local agent and design working notes
+/AGENTS.md
+/docs/ui-implementation-plan.md
+/docs/ui-improvements.md
+
+# Local signing credentials and environment files
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.mobileprovision

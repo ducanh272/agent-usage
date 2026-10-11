@@ -1,0 +1,19 @@
+name: macOS CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+      - name: Test
+        run: swift test --disable-sandbox
+      - name: Build app bundle
+        run: sh scripts/build-app.sh
